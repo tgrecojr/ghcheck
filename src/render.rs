@@ -75,7 +75,7 @@ pub fn print(prs: &[PullRequest]) {
 
     for pr in &sorted {
         table.add_row(vec![
-            Cell::new(&pr.repository.name_with_owner),
+            Cell::new(sanitize(&pr.repository.name_with_owner)),
             Cell::new(format!("#{}", pr.number)),
             Cell::new(format!("{}{}", truncate(&pr.title, 60), draft_marker(pr))),
             Cell::new(pr.author_login()),
@@ -99,18 +99,18 @@ pub fn print(prs: &[PullRequest]) {
         for pr in &failing {
             println!(
                 "\n  {} {} {}",
-                pr.repository.name_with_owner.cyan(),
+                sanitize(&pr.repository.name_with_owner).cyan(),
                 format!("#{}", pr.number).cyan(),
                 truncate(&pr.title, 80).dimmed()
             );
             if let Some(rollup) = pr.rollup() {
                 for ctx in &rollup.contexts.nodes {
                     if let Some(name) = failed_check_name(ctx) {
-                        println!("    {} {}", "✗".red(), name);
+                        println!("    {} {}", "✗".red(), sanitize(&name));
                     }
                 }
             }
-            println!("    {}", pr.url.dimmed());
+            println!("    {}", sanitize(&pr.url).dimmed());
         }
     }
 
@@ -119,7 +119,7 @@ pub fn print(prs: &[PullRequest]) {
         for pr in &conflicts {
             println!(
                 "  {} {} {}",
-                pr.repository.name_with_owner.cyan(),
+                sanitize(&pr.repository.name_with_owner).cyan(),
                 format!("#{}", pr.number).cyan(),
                 truncate(&pr.title, 80).dimmed()
             );
@@ -161,9 +161,16 @@ fn failed_check_name(ctx: &CheckContext) -> Option<String> {
     }
 }
 
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() && c != '\t' { '·' } else { c })
+        .collect()
+}
+
 fn truncate(s: &str, max: usize) -> String {
+    let s = sanitize(s);
     if s.chars().count() <= max {
-        s.to_string()
+        s
     } else {
         let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
         out.push('…');
