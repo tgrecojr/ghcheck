@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
 use owo_colors::OwoColorize;
+use std::collections::HashMap;
 
 pub fn filter(
     prs: Vec<PullRequest>,
@@ -139,6 +140,28 @@ pub fn print(prs: &[PullRequest]) {
     );
 }
 
+/// Reduce merged PRs to the single most-recently-merged PR per repository, then
+/// keep only those whose post-merge CI is still failing.
+///
+/// Each merge to the default branch re-runs the post-merge pipeline (supply-chain
+/// scan, docker build+push) over the full rolled-up tree. If the latest merge in a
+/// repo is green, any earlier failures in the window are already superseded — their
+/// changes were rolled into the latest (passing) build. So only a still-red latest
+/// merge warrants attention; reporting the stale failures is just noise.
+pub fn latest_failing_per_repo(merged: Vec<MergedPullRequest>) -> Vec<MergedPullRequest> {
+    let mut latest: HashMap<String, MergedPullRequest> = HashMap::new();
+    for pr in merged {
+        match latest.get(&pr.repository.name_with_owner) {
+            // `merged_at` is RFC3339 UTC ("…Z"), so lexicographic == chronological order.
+            Some(existing) if existing.merged_at >= pr.merged_at => {}
+            _ => {
+                latest.insert(pr.repository.name_with_owner.clone(), pr);
+            }
+        }
+    }
+    latest.into_values().filter(|pr| pr.is_failing()).collect()
+}
+
 /// Render post-merge CI failures: PRs that merged cleanly but whose default-branch
 /// workflow (supply-chain scan, docker build+push, etc.) failed. Silent when empty.
 pub fn print_post_merge(prs: &[MergedPullRequest]) {
@@ -228,4 +251,61 @@ fn humanize_age(created_at: &str) -> String {
     }
     let minutes = diff.num_minutes().max(0);
     format!("{minutes}m")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Commit, Contexts, MergedPullRequest, Repository, StatusCheckRollup};
+
+    fn merged(repo: &str, number: u32, merged_at: &str, state: &str) -> MergedPullRequest {
+        MergedPullRequest {
+            number,
+            title: format!("PR #{number}"),
+            url: format!("https://example.test/{repo}/pull/{number}"),
+            merged_at: merged_at.to_string(),
+            author: None,
+            repository: Repository {
+                name_with_owner: repo.to_string(),
+            },
+            merge_commit: Some(Commit {
+                status_check_rollup: Some(StatusCheckRollup {
+                    state: state.to_string(),
+                    contexts: Contexts { nodes: vec![] },
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn latest_green_supersedes_earlier_failures() {
+        // Same repo: an early failure followed by a later passing merge — should be silent.
+        let out = latest_failing_per_repo(vec![
+            merged("o/r", 1, "2026-06-18T10:00:00Z", "FAILURE"),
+            merged("o/r", 2, "2026-06-20T10:00:00Z", "SUCCESS"),
+        ]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn latest_red_is_reported_despite_earlier_pass() {
+        let out = latest_failing_per_repo(vec![
+            merged("o/r", 1, "2026-06-18T10:00:00Z", "SUCCESS"),
+            merged("o/r", 2, "2026-06-20T10:00:00Z", "FAILURE"),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].number, 2);
+    }
+
+    #[test]
+    fn repos_are_independent() {
+        // One repo's latest is red, another's latest is green; only the red one surfaces.
+        let out = latest_failing_per_repo(vec![
+            merged("o/red", 1, "2026-06-20T10:00:00Z", "FAILURE"),
+            merged("o/green", 2, "2026-06-19T10:00:00Z", "FAILURE"),
+            merged("o/green", 3, "2026-06-21T10:00:00Z", "SUCCESS"),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].repository.name_with_owner, "o/red");
+    }
 }
