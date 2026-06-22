@@ -3,7 +3,11 @@ mod model;
 mod render;
 
 use anyhow::Result;
+use chrono::{Duration, Utc};
 use clap::Parser;
+
+/// How far back to look for merged PRs when checking post-merge CI.
+const POST_MERGE_LOOKBACK_DAYS: i64 = 7;
 
 #[derive(Parser)]
 #[command(
@@ -35,10 +39,21 @@ fn main() -> Result<()> {
     let prs = github::fetch_prs(&owner)?;
     let filtered = render::filter(prs, cli.failing, cli.bot, cli.no_drafts);
 
+    let since = (Utc::now() - Duration::days(POST_MERGE_LOOKBACK_DAYS))
+        .format("%Y-%m-%d")
+        .to_string();
+    let merged = github::fetch_merged_prs(&owner, &since)?;
+    let post_merge_failures: Vec<_> = merged.into_iter().filter(|pr| pr.is_failing()).collect();
+
     if cli.json {
-        println!("{}", serde_json::to_string_pretty(&filtered)?);
+        let out = serde_json::json!({
+            "open": filtered,
+            "post_merge_failures": post_merge_failures,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         render::print(&filtered);
+        render::print_post_merge(&post_merge_failures);
     }
     Ok(())
 }

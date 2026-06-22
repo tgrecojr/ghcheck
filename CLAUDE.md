@@ -27,11 +27,13 @@ A small Rust CLI that prints a consolidated, color-coded view of the user's pers
 Single-binary CLI with three internal modules:
 
 - `src/main.rs` — clap arg parsing, top-level orchestration
-- `src/github.rs` — shells out to `gh api graphql` to fetch open PRs scoped to `user:<login>`; uses `gh api user` to discover the current login at runtime
-- `src/model.rs` — serde structs mirroring the GraphQL response, plus convenience methods (`is_failing`, `is_bot`, `rollup`, `author_login`)
-- `src/render.rs` — filtering logic and colored table output, including a "Failing checks" detail section that names each failed check inline
+- `src/github.rs` — shells out to `gh api graphql`. `fetch_prs` fetches open PRs scoped to `user:<login>`; `fetch_merged_prs` fetches PRs merged in the last 7 days and their merge-commit check rollup (post-merge CI). Uses `gh api user` to discover the current login at runtime
+- `src/model.rs` — serde structs mirroring the GraphQL responses (generic `GraphQLResponse<T>` wrapper), plus convenience methods. `PullRequest` (`is_failing`, `is_bot`, `rollup`, `author_login`) and `MergedPullRequest` (`merge_rollup`, `is_failing`)
+- `src/render.rs` — filtering logic and colored table output. Includes a "Failing checks" detail section for open PRs and a "Post-merge CI failures" section that names each failed default-branch check inline; both stay silent when empty
 
-Data flow: `main` → `github::current_user` → `github::fetch_prs(owner)` → `render::filter` → `render::print` (or JSON).
+Data flow: `main` → `github::current_user` → `github::fetch_prs(owner)` + `github::fetch_merged_prs(owner, since)` → `render::filter` → `render::print` + `render::print_post_merge` (or combined JSON under `open` / `post_merge_failures` keys).
+
+The post-merge section exists because post-merge workflows (supply-chain scan, docker build+push) are triggered by the push to the default branch, so their check suite attaches to the **merge commit** — not the PR head commit the open-PR rollup reflects. Without this, a PR that merges green but fails its delivery pipeline is silent.
 
 ## Environment Variables
 

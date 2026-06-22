@@ -1,4 +1,4 @@
-use crate::model::{CheckContext, PullRequest};
+use crate::model::{CheckContext, MergedPullRequest, PullRequest};
 use chrono::{DateTime, Utc};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
@@ -137,6 +137,41 @@ pub fn print(prs: &[PullRequest]) {
         )
         .dimmed()
     );
+}
+
+/// Render post-merge CI failures: PRs that merged cleanly but whose default-branch
+/// workflow (supply-chain scan, docker build+push, etc.) failed. Silent when empty.
+pub fn print_post_merge(prs: &[MergedPullRequest]) {
+    if prs.is_empty() {
+        return;
+    }
+
+    let mut sorted: Vec<&MergedPullRequest> = prs.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.repository
+            .name_with_owner
+            .cmp(&b.repository.name_with_owner)
+            .then_with(|| a.number.cmp(&b.number))
+    });
+
+    println!("\n{}", "⚠ Post-merge CI failures:".bold().underline().red());
+    for pr in &sorted {
+        println!(
+            "\n  {} {} {} {}",
+            sanitize(&pr.repository.name_with_owner).cyan(),
+            format!("#{}", pr.number).cyan(),
+            truncate(&pr.title, 60).dimmed(),
+            format!("(merged {} ago)", humanize_age(&pr.merged_at)).dimmed()
+        );
+        if let Some(rollup) = pr.merge_rollup() {
+            for ctx in &rollup.contexts.nodes {
+                if let Some(name) = failed_check_name(ctx) {
+                    println!("    {} {}", "✗".red(), sanitize(&name));
+                }
+            }
+        }
+        println!("    {}", sanitize(&pr.url).dimmed());
+    }
 }
 
 fn failed_check_name(ctx: &CheckContext) -> Option<String> {
