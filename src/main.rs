@@ -43,7 +43,7 @@ fn main() -> Result<()> {
         .format("%Y-%m-%d")
         .to_string();
     let merged = github::fetch_merged_prs(&owner, &since)?;
-    let post_merge_failures: Vec<_> = merged.into_iter().filter(|pr| pr.is_failing()).collect();
+    let post_merge_failures = render::latest_failing_per_repo(merged);
 
     if cli.json {
         let out = serde_json::json!({
