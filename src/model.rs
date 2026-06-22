@@ -1,18 +1,18 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
-pub struct GraphQLResponse {
-    pub data: Data,
+pub struct GraphQLResponse<T> {
+    pub data: Data<T>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Data {
-    pub search: Search,
+pub struct Data<T> {
+    pub search: Search<T>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct Search {
-    pub nodes: Vec<PullRequest>,
+pub struct Search<T> {
+    pub nodes: Vec<T>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -84,6 +84,40 @@ pub enum CheckContext {
         #[serde(rename = "targetUrl")]
         target_url: Option<String>,
     },
+}
+
+/// A recently-merged PR, used to check post-merge CI on the default branch.
+///
+/// The post-merge supply-chain scan / docker build+push workflows are triggered
+/// by the push to the default branch, so their check suite attaches to the merge
+/// commit — not the PR head commit. `merge_commit.status_check_rollup` is that
+/// post-merge status.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MergedPullRequest {
+    pub number: u32,
+    pub title: String,
+    pub url: String,
+    #[serde(rename = "mergedAt")]
+    pub merged_at: String,
+    pub author: Option<Author>,
+    pub repository: Repository,
+    #[serde(rename = "mergeCommit")]
+    pub merge_commit: Option<Commit>,
+}
+
+impl MergedPullRequest {
+    pub fn merge_rollup(&self) -> Option<&StatusCheckRollup> {
+        self.merge_commit
+            .as_ref()
+            .and_then(|c| c.status_check_rollup.as_ref())
+    }
+
+    pub fn is_failing(&self) -> bool {
+        matches!(
+            self.merge_rollup().map(|r| r.state.as_str()),
+            Some("FAILURE") | Some("ERROR")
+        )
+    }
 }
 
 impl PullRequest {
