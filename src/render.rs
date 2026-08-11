@@ -68,7 +68,7 @@ pub fn print(prs: &[PullRequest]) {
 
     let mut table = Table::new();
     table
-        .load_preset(UTF8_FULL)
+        .load_style(UTF8_FULL)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec![
             "REPO", "PR", "TITLE", "AUTHOR", "STATUS", "MERGE", "AGE",
