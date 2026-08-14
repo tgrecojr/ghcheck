@@ -1,4 +1,5 @@
 use crate::model::{CheckContext, MergedPullRequest, PullRequest};
+use crate::text::sanitize;
 use chrono::{DateTime, Utc};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
@@ -25,7 +26,11 @@ fn status_cell(pr: &PullRequest) -> String {
             "FAILURE" | "ERROR" => "FAIL".red().bold().to_string(),
             "PENDING" => "PENDING".yellow().to_string(),
             "EXPECTED" => "EXPECTED".dimmed().to_string(),
-            other => other.to_string(),
+            // A member GitHub adds later reaches this arm as a raw remote
+            // string. Encode it here, before any styling, so the cell's own
+            // escape sequences stay intact while the remote value cannot
+            // contribute any of its own.
+            other => sanitize(other),
         },
         None => "no checks".dimmed().to_string(),
     }
@@ -36,8 +41,49 @@ fn merge_cell(pr: &PullRequest) -> String {
         "MERGEABLE" => "ok".green().to_string(),
         "CONFLICTING" => "CONFLICT".red().bold().to_string(),
         "UNKNOWN" => "?".dimmed().to_string(),
-        other => other.dimmed().to_string(),
+        // `.dimmed()` wraps the value in escape sequences; it does not encode
+        // it. Encode first, then style.
+        other => sanitize(other).dimmed().to_string(),
     }
+}
+
+/// Build a table cell from untrusted remote data.
+///
+/// Every column carrying a remote string goes through here, so adding a column
+/// without an encoder is not something you can do by forgetting — it is
+/// something you would have to do deliberately by calling `Cell::new` instead.
+/// Cells holding already-styled local content (`status_cell`, `merge_cell`) are
+/// the deliberate exception: they encode their remote input themselves, before
+/// applying the tool's own colours.
+fn cell(s: impl AsRef<str>) -> Cell {
+    Cell::new(sanitize(s.as_ref()))
+}
+
+/// Build the open-PR table. Split out from `print` so the rendered output can
+/// be asserted on in tests without capturing stdout.
+fn build_table(sorted: &[&PullRequest]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_style(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "REPO", "PR", "TITLE", "AUTHOR", "STATUS", "MERGE", "AGE",
+        ]);
+
+    for pr in sorted {
+        table.add_row(vec![
+            cell(&pr.repository.name_with_owner),
+            cell(format!("#{}", pr.number)),
+            cell(format!("{}{}", truncate(&pr.title, 60), draft_marker(pr))),
+            cell(pr.author_login()),
+            // Pre-styled: these encode their remote input internally so the
+            // tool's own colour codes survive. See status_cell / merge_cell.
+            Cell::new(status_cell(pr)),
+            Cell::new(merge_cell(pr)),
+            cell(humanize_age(&pr.created_at)),
+        ]);
+    }
+    table
 }
 
 fn draft_marker(pr: &PullRequest) -> &'static str {
@@ -66,27 +112,7 @@ pub fn print(prs: &[PullRequest]) {
             .then_with(|| a.number.cmp(&b.number))
     });
 
-    let mut table = Table::new();
-    table
-        .load_style(UTF8_FULL)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            "REPO", "PR", "TITLE", "AUTHOR", "STATUS", "MERGE", "AGE",
-        ]);
-
-    for pr in &sorted {
-        table.add_row(vec![
-            Cell::new(sanitize(&pr.repository.name_with_owner)),
-            Cell::new(format!("#{}", pr.number)),
-            Cell::new(format!("{}{}", truncate(&pr.title, 60), draft_marker(pr))),
-            Cell::new(pr.author_login()),
-            Cell::new(status_cell(pr)),
-            Cell::new(merge_cell(pr)),
-            Cell::new(humanize_age(&pr.created_at)),
-        ]);
-    }
-
-    println!("{table}");
+    println!("{}", build_table(&sorted));
 
     let failing: Vec<&PullRequest> = sorted.iter().copied().filter(|p| p.is_failing()).collect();
     let conflicts: Vec<&PullRequest> = sorted
@@ -219,12 +245,6 @@ fn failed_check_name(ctx: &CheckContext) -> Option<String> {
     }
 }
 
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() && c != '\t' { '·' } else { c })
-        .collect()
-}
-
 fn truncate(s: &str, max: usize) -> String {
     let s = sanitize(s);
     if s.chars().count() <= max {
@@ -256,7 +276,148 @@ fn humanize_age(created_at: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Commit, Contexts, MergedPullRequest, Repository, StatusCheckRollup};
+    use crate::model::{
+        Author, Commit, CommitNode, Commits, Contexts, MergedPullRequest, Repository,
+        StatusCheckRollup,
+    };
+
+    /// An open PR whose rollup state and mergeable state are attacker-chosen.
+    /// Both feed match arms with an `other =>` fallback.
+    fn open_pr(mergeable: &str, rollup_state: &str) -> PullRequest {
+        PullRequest {
+            number: 1,
+            title: "t".to_string(),
+            url: "https://example.test/o/r/pull/1".to_string(),
+            created_at: "2026-06-20T10:00:00Z".to_string(),
+            author: None,
+            mergeable: mergeable.to_string(),
+            is_draft: false,
+            repository: Repository {
+                name_with_owner: "o/r".to_string(),
+            },
+            commits: Commits {
+                nodes: vec![CommitNode {
+                    commit: Commit {
+                        status_check_rollup: Some(StatusCheckRollup {
+                            state: rollup_state.to_string(),
+                            contexts: Contexts { nodes: vec![] },
+                        }),
+                    },
+                }],
+            },
+        }
+    }
+
+    /// A payload the terminal would act on: colour escape, then BEL.
+    const HOSTILE: &str = "\u{1b}[31mFORGED-PASS\u{1b}[0m\u{7}";
+
+    /// An open PR with an attacker-chosen author login.
+    fn open_pr_authored_by(login: &str) -> PullRequest {
+        let mut pr = open_pr("MERGEABLE", "SUCCESS");
+        pr.author = Some(Author {
+            login: login.to_string(),
+        });
+        pr
+    }
+
+    #[test]
+    fn author_column_is_encoded() {
+        // GitHub constrains logins to [A-Za-z0-9-], but that is an external
+        // guarantee this codebase asserts nowhere. The renderer must not depend
+        // on it.
+        let pr = open_pr_authored_by(HOSTILE);
+        let rendered = build_table(&[&pr]).to_string();
+        assert!(
+            !rendered.contains("\u{1b}[31mFORGED-PASS"),
+            "attacker colour sequence reached the table: {rendered:?}"
+        );
+        assert!(!rendered.contains('\u{7}'), "BEL reached the table");
+    }
+
+    #[test]
+    fn every_remote_string_column_is_encoded() {
+        // Closes the class rather than the one column that was found: repo
+        // name, title and author all carry remote data into the table.
+        let mut pr = open_pr_authored_by(HOSTILE);
+        pr.title = HOSTILE.to_string();
+        pr.repository.name_with_owner = HOSTILE.to_string();
+        let rendered = build_table(&[&pr]).to_string();
+        assert!(!rendered.contains('\u{7}'), "BEL reached the table");
+        assert!(
+            !rendered.contains("\u{1b}[31mFORGED-PASS"),
+            "attacker colour sequence reached the table: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_author_is_left_intact() {
+        let pr = open_pr_authored_by("renovate[bot]");
+        assert!(build_table(&[&pr]).to_string().contains("renovate[bot]"));
+    }
+
+    /// A benign but unrecognized member — reaches the same fallback arm without
+    /// carrying any escape sequence of its own. Any control character the
+    /// hostile case emits beyond what this emits is attacker-contributed.
+    const BENIGN_UNKNOWN: &str = "SOME_NEW_STATE";
+
+    fn control_chars(s: &str) -> usize {
+        s.chars().filter(|c| c.is_control()).count()
+    }
+
+    #[test]
+    fn status_cell_fallback_arm_encodes_unrecognized_state() {
+        // An unrecognized StatusCheckRollup.state (a member GitHub adds later)
+        // must not contribute escape sequences of its own.
+        let hostile = status_cell(&open_pr("MERGEABLE", HOSTILE));
+        let benign = status_cell(&open_pr("MERGEABLE", BENIGN_UNKNOWN));
+        assert_eq!(
+            control_chars(&hostile),
+            control_chars(&benign),
+            "remote state contributed control characters: {hostile:?}"
+        );
+        assert!(!hostile.contains('\u{7}'), "BEL survived: {hostile:?}");
+        assert!(
+            !hostile.contains("\u{1b}[31m"),
+            "attacker colour sequence survived: {hostile:?}"
+        );
+    }
+
+    #[test]
+    fn merge_cell_fallback_arm_encodes_unrecognized_state() {
+        // `.dimmed()` wraps the value in the tool's OWN escapes; it does not
+        // encode the value. The differential isolates the attacker's bytes from
+        // the styling the fix legitimately applies.
+        let hostile = merge_cell(&open_pr(HOSTILE, "SUCCESS"));
+        let benign = merge_cell(&open_pr(BENIGN_UNKNOWN, "SUCCESS"));
+        assert_eq!(
+            control_chars(&hostile),
+            control_chars(&benign),
+            "remote mergeable contributed control characters: {hostile:?}"
+        );
+        assert!(!hostile.contains('\u{7}'), "BEL survived: {hostile:?}");
+        assert!(
+            !hostile.contains("\u{1b}[31m"),
+            "attacker colour sequence survived: {hostile:?}"
+        );
+    }
+
+    #[test]
+    fn recognized_states_keep_their_styling() {
+        // The fix must encode the untrusted value without stripping the tool's
+        // own colour codes, which comfy-table's custom_styling renders.
+        let pass = status_cell(&open_pr("MERGEABLE", "SUCCESS"));
+        assert!(pass.contains("PASS"), "expected PASS text: {pass:?}");
+        assert!(
+            pass.contains('\u{1b}'),
+            "own colour codes were stripped: {pass:?}"
+        );
+        let ok = merge_cell(&open_pr("MERGEABLE", "SUCCESS"));
+        assert!(ok.contains("ok"), "expected ok text: {ok:?}");
+        assert!(
+            ok.contains('\u{1b}'),
+            "own colour codes were stripped: {ok:?}"
+        );
+    }
 
     fn merged(repo: &str, number: u32, merged_at: &str, state: &str) -> MergedPullRequest {
         MergedPullRequest {
