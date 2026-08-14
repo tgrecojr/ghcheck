@@ -34,7 +34,30 @@ struct Cli {
     json: bool,
 }
 
-fn main() -> Result<()> {
+/// Render a terminating error for display.
+///
+/// `{err:?}` on an anyhow error prints the whole `Caused by:` chain, and a
+/// source error's own `Display` may quote remote data verbatim —
+/// `serde_json::Error` does exactly that with the offending value. Every
+/// `.context()` message in this crate is a static literal, so the leak enters
+/// through the source error rather than through any format argument. Encoding
+/// the fully-formatted string is what closes it, and it covers future
+/// `.context()` sites for free.
+fn render_error(err: &anyhow::Error) -> String {
+    text::sanitize(&format!("{err:?}"))
+}
+
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {}", render_error(&err));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let owner = github::current_user()?;
     let prs = github::fetch_prs(&owner)?;
@@ -57,4 +80,46 @@ fn main() -> Result<()> {
         render::print_post_merge(&post_merge_failures);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+
+    /// Build the shape the vulnerability actually takes: a static .context()
+    /// message wrapping a source error whose OWN Display quotes remote bytes.
+    /// The leak enters through the source, not through the format arguments,
+    /// which is why auditing the .context() strings could not find it.
+    fn error_with_hostile_source() -> anyhow::Error {
+        let hostile = "\u{1b}[2J\u{1b}[H\u{1b}[32mAll checks passed\u{1b}[0m\u{7}";
+        let source: Result<(), _> = Err(std::io::Error::other(format!(
+            "unknown variant `{hostile}`"
+        )));
+        source
+            .context("failed to parse gh GraphQL response")
+            .unwrap_err()
+    }
+
+    #[test]
+    fn terminating_error_is_encoded() {
+        let rendered = render_error(&error_with_hostile_source());
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC reached stderr: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{7}'),
+            "BEL reached stderr: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn terminating_error_keeps_the_source_chain() {
+        // Encoding must not cost the operator the diagnostic: the context
+        // message and the underlying cause both still have to be readable.
+        let rendered = render_error(&error_with_hostile_source());
+        assert!(rendered.contains("failed to parse gh GraphQL response"));
+        assert!(rendered.contains("unknown variant"));
+    }
 }
