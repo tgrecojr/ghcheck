@@ -1,4 +1,5 @@
 use crate::model::{CheckContext, MergedPullRequest, PullRequest};
+use crate::text::sanitize;
 use chrono::{DateTime, Utc};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
@@ -217,12 +218,6 @@ fn failed_check_name(ctx: &CheckContext) -> Option<String> {
             }
         }
     }
-}
-
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() && c != '\t' { '·' } else { c })
-        .collect()
 }
 
 fn truncate(s: &str, max: usize) -> String {

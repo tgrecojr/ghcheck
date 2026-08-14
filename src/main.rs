@@ -1,6 +1,7 @@
 mod github;
 mod model;
 mod render;
+mod text;
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
