@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
 use owo_colors::OwoColorize;
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 pub fn filter(
     prs: Vec<PullRequest>,
@@ -170,26 +170,46 @@ pub fn print(prs: &[PullRequest]) {
     );
 }
 
-/// Reduce merged PRs to the single most-recently-merged PR per repository, then
-/// keep only those whose post-merge CI is still failing.
+/// Report, per repository, the newest merge that has a settled verdict — but
+/// only when that verdict is a failure.
 ///
-/// Each merge to the default branch re-runs the post-merge pipeline (supply-chain
-/// scan, docker build+push) over the full rolled-up tree. If the latest merge in a
-/// repo is green, any earlier failures in the window are already superseded — their
-/// changes were rolled into the latest (passing) build. So only a still-red latest
-/// merge warrants attention; reporting the stale failures is just noise.
-pub fn latest_failing_per_repo(merged: Vec<MergedPullRequest>) -> Vec<MergedPullRequest> {
-    let mut latest: HashMap<String, MergedPullRequest> = HashMap::new();
+/// Each merge to the default branch re-runs the post-merge pipeline
+/// (supply-chain scan, docker build+push) over the full rolled-up tree. A
+/// *passing* rebuild is therefore a positive argument that every earlier change
+/// in the window is now green, and it supersedes earlier failures.
+///
+/// Only a passing one. The previous implementation picked each repo's winner by
+/// recency and consulted the verdict afterwards, so a newer merge that had not
+/// finished CI — or had no merge commit at all — evicted a real FAILURE that
+/// then never printed. An unsettled verdict is not evidence of anything, so it
+/// no longer supersedes: the scan falls through to the newest merge that does
+/// have a verdict. No attacker is needed to hit that case; an ordinary merge
+/// landing while CI is queued is enough.
+pub fn latest_failing_per_repo(mut merged: Vec<MergedPullRequest>) -> Vec<MergedPullRequest> {
+    // Newest first, so the first settled verdict per repo is the deciding one.
+    merged.sort_by(|a, b| b.merged_at.cmp(&a.merged_at));
+
+    let mut decided: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
     for pr in merged {
-        match latest.get(&pr.repository.name_with_owner) {
-            // `merged_at` is RFC3339 UTC ("…Z"), so lexicographic == chronological order.
-            Some(existing) if existing.merged_at >= pr.merged_at => {}
-            _ => {
-                latest.insert(pr.repository.name_with_owner.clone(), pr);
+        if decided.contains(&pr.repository.name_with_owner) {
+            continue;
+        }
+        match pr.verdict() {
+            // A green rebuild settles this repo and supersedes what came before.
+            Verdict::Passing => {
+                decided.insert(pr.repository.name_with_owner.clone());
             }
+            // A red rebuild settles this repo and is what we are here to report.
+            Verdict::Failing => {
+                decided.insert(pr.repository.name_with_owner.clone());
+                out.push(pr);
+            }
+            // No verdict yet: decides nothing, so keep looking further back.
+            Verdict::Unknown => {}
         }
     }
-    latest.into_values().filter(|pr| pr.is_failing()).collect()
+    out
 }
 
 /// Render post-merge CI failures: PRs that merged cleanly but whose default-branch
@@ -482,6 +502,81 @@ mod tests {
     fn failing_filter_still_excludes_passing_prs() {
         let out = filter(vec![open_pr(1, Some("SUCCESS"))], true, false, false);
         assert!(out.is_empty(), "a green PR was surfaced by --failing");
+    }
+
+    /// A merged PR whose merge commit carries no rollup at all.
+    fn merged_no_rollup(repo: &str, number: u32, merged_at: &str) -> MergedPullRequest {
+        let mut m = merged(repo, number, merged_at, "SUCCESS");
+        m.merge_commit = Some(Commit {
+            status_check_rollup: None,
+        });
+        m
+    }
+
+    /// A merged PR with no merge commit recorded at all.
+    fn merged_no_commit(repo: &str, number: u32, merged_at: &str) -> MergedPullRequest {
+        let mut m = merged(repo, number, merged_at, "SUCCESS");
+        m.merge_commit = None;
+        m
+    }
+
+    #[test]
+    fn a_verdictless_newer_merge_does_not_evict_a_failure() {
+        // Supersession is justified only by a PASSING rebuild — that is the
+        // argument that the earlier changes are now green. A pending or absent
+        // verdict proves nothing and must not consume the evidence.
+        for (label, newer) in [
+            (
+                "null rollup",
+                merged_no_rollup("o/r", 2, "2026-08-12T10:00:00Z"),
+            ),
+            (
+                "no merge commit",
+                merged_no_commit("o/r", 2, "2026-08-12T10:00:00Z"),
+            ),
+            (
+                "pending",
+                merged("o/r", 2, "2026-08-12T10:00:00Z", "PENDING"),
+            ),
+        ] {
+            let out = latest_failing_per_repo(vec![
+                merged("o/r", 1, "2026-08-11T10:00:00Z", "FAILURE"),
+                newer,
+            ]);
+            assert_eq!(
+                out.len(),
+                1,
+                "a newer merge with a {label} verdict evicted a real FAILURE"
+            );
+            assert_eq!(out[0].number, 1);
+        }
+    }
+
+    #[test]
+    fn an_unsettled_merge_falls_through_to_the_newest_settled_one() {
+        // Two unsettled merges on top of a failure must still not hide it.
+        let out = latest_failing_per_repo(vec![
+            merged("o/r", 1, "2026-08-10T10:00:00Z", "FAILURE"),
+            merged("o/r", 2, "2026-08-11T10:00:00Z", "PENDING"),
+            merged_no_rollup("o/r", 3, "2026-08-12T10:00:00Z"),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].number, 1);
+    }
+
+    #[test]
+    fn an_unsettled_merge_does_not_resurrect_a_superseded_failure() {
+        // Ordering matters: FAILURE, then a genuine PASS, then an unsettled
+        // merge. The pass already superseded the failure, so nothing reports.
+        let out = latest_failing_per_repo(vec![
+            merged("o/r", 1, "2026-08-10T10:00:00Z", "FAILURE"),
+            merged("o/r", 2, "2026-08-11T10:00:00Z", "SUCCESS"),
+            merged_no_rollup("o/r", 3, "2026-08-12T10:00:00Z"),
+        ]);
+        assert!(
+            out.is_empty(),
+            "a failure already superseded by a green rebuild was resurrected"
+        );
     }
 
     #[test]

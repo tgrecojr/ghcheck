@@ -181,10 +181,6 @@ impl MergedPullRequest {
     pub fn verdict(&self) -> Verdict {
         rollup_verdict(self.merge_rollup())
     }
-
-    pub fn is_failing(&self) -> bool {
-        matches!(self.verdict(), Verdict::Failing)
-    }
 }
 
 impl PullRequest {
@@ -357,6 +353,5 @@ mod tests {
             merge_commit: None,
         };
         assert_eq!(m.verdict(), Verdict::Unknown);
-        assert!(!m.is_failing());
     }
 }
