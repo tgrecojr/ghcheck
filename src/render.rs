@@ -170,6 +170,24 @@ pub fn print(prs: &[PullRequest]) {
     );
 }
 
+/// Sort key for a merge time.
+///
+/// Parsed rather than compared as a string, so the ordering does not silently
+/// depend on GitHub continuing to serialize fixed-width RFC3339 `…Z` values. An
+/// unparseable timestamp sorts oldest, so a record we cannot place can never
+/// win the newest slot and supersede a real verdict.
+fn merged_at_key(pr: &MergedPullRequest) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&pr.merged_at)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// Order a failing verdict ahead of any other, for use as a tie-break.
+fn a_fails_first(a: &MergedPullRequest, b: &MergedPullRequest) -> std::cmp::Ordering {
+    let rank = |pr: &MergedPullRequest| u8::from(pr.verdict() != Verdict::Failing);
+    rank(a).cmp(&rank(b))
+}
+
 /// Report, per repository, the newest merge that has a settled verdict — but
 /// only when that verdict is a failure.
 ///
@@ -187,7 +205,24 @@ pub fn print(prs: &[PullRequest]) {
 /// landing while CI is queued is enough.
 pub fn latest_failing_per_repo(mut merged: Vec<MergedPullRequest>) -> Vec<MergedPullRequest> {
     // Newest first, so the first settled verdict per repo is the deciding one.
-    merged.sort_by(|a, b| b.merged_at.cmp(&a.merged_at));
+    //
+    // The order must be *total*: `mergedAt` has one-second granularity, so two
+    // merges sharing a timestamp are ordinary, and comparing on the timestamp
+    // alone left the winner to be whichever node the API happened to return
+    // first. Ties break on the failing verdict, then on PR number, so the
+    // result is reproducible across runs.
+    merged.sort_by(|a, b| {
+        merged_at_key(b)
+            .cmp(&merged_at_key(a))
+            // Within the same second we cannot tell which merge landed last, so
+            // we cannot argue the green build contains the red one's changes.
+            // Look at the failure first and report it, rather than assume it
+            // away. (The scan proposed breaking ties on PR number alone, which
+            // is deterministic but would let a tied pass bury a tied failure —
+            // PR number tracks creation order, not merge order.)
+            .then_with(|| a_fails_first(a, b))
+            .then_with(|| b.number.cmp(&a.number))
+    });
 
     let mut decided: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -576,6 +611,57 @@ mod tests {
         assert!(
             out.is_empty(),
             "a failure already superseded by a green rebuild was resurrected"
+        );
+    }
+
+    #[test]
+    fn a_merged_at_tie_resolves_identically_regardless_of_arrival_order() {
+        // mergedAt has one-second granularity, so ties are ordinary. The answer
+        // must not depend on the order GitHub happened to return the nodes in.
+        let red = || merged("o/r", 1, "2026-08-12T10:00:00Z", "FAILURE");
+        let green = || merged("o/r", 2, "2026-08-12T10:00:00Z", "SUCCESS");
+
+        let red_first = latest_failing_per_repo(vec![red(), green()]);
+        let green_first = latest_failing_per_repo(vec![green(), red()]);
+
+        assert_eq!(
+            red_first.len(),
+            green_first.len(),
+            "the same two records produced different answers depending on order"
+        );
+    }
+
+    #[test]
+    fn a_merged_at_tie_does_not_let_a_pass_bury_a_failure() {
+        // When two merges share a timestamp we genuinely cannot tell which
+        // landed second, so we cannot claim the green build contains the red
+        // one's changes. Report the failure rather than assume it away.
+        for input in [
+            vec![
+                merged("o/r", 1, "2026-08-12T10:00:00Z", "FAILURE"),
+                merged("o/r", 2, "2026-08-12T10:00:00Z", "SUCCESS"),
+            ],
+            vec![
+                merged("o/r", 2, "2026-08-12T10:00:00Z", "SUCCESS"),
+                merged("o/r", 1, "2026-08-12T10:00:00Z", "FAILURE"),
+            ],
+        ] {
+            let out = latest_failing_per_repo(input);
+            assert_eq!(out.len(), 1, "tied failure was buried by a tied pass");
+            assert_eq!(out[0].number, 1);
+        }
+    }
+
+    #[test]
+    fn a_later_pass_still_supersedes_an_earlier_failure() {
+        // The tie rule must not weaken genuine supersession at distinct times.
+        let out = latest_failing_per_repo(vec![
+            merged("o/r", 1, "2026-08-12T10:00:00Z", "FAILURE"),
+            merged("o/r", 2, "2026-08-12T10:00:01Z", "SUCCESS"),
+        ]);
+        assert!(
+            out.is_empty(),
+            "a genuinely later green merge stopped superseding"
         );
     }
 
