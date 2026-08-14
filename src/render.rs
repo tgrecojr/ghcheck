@@ -1,4 +1,4 @@
-use crate::model::{CheckContext, MergedPullRequest, PullRequest};
+use crate::model::{CheckContext, MergedPullRequest, PullRequest, Verdict};
 use crate::text::sanitize;
 use chrono::{DateTime, Utc};
 use comfy_table::presets::UTF8_FULL;
@@ -15,7 +15,11 @@ pub fn filter(
     prs.into_iter()
         .filter(|pr| !(no_drafts && pr.is_draft))
         .filter(|pr| !only_bot || pr.is_bot())
-        .filter(|pr| !only_failing || pr.is_failing())
+        // --failing means "not known to be green", not "known to be red". A PR
+        // whose verdict is unsettled is exactly the case an attacker can
+        // manufacture by pushing a commit, so excluding it would reopen the
+        // hole the Verdict tri-state exists to close.
+        .filter(|pr| !only_failing || pr.verdict() != Verdict::Passing)
         .collect()
 }
 
@@ -225,23 +229,9 @@ pub fn print_post_merge(prs: &[MergedPullRequest]) {
 
 fn failed_check_name(ctx: &CheckContext) -> Option<String> {
     match ctx {
-        CheckContext::CheckRun {
-            name, conclusion, ..
-        } => match conclusion.as_deref() {
-            Some("FAILURE")
-            | Some("TIMED_OUT")
-            | Some("CANCELLED")
-            | Some("STARTUP_FAILURE")
-            | Some("ACTION_REQUIRED") => Some(name.clone()),
-            _ => None,
-        },
-        CheckContext::StatusContext { context, state, .. } => {
-            if state == "FAILURE" || state == "ERROR" {
-                Some(context.clone())
-            } else {
-                None
-            }
-        }
+        CheckContext::CheckRun { name, .. } if ctx.has_failed() => Some(name.clone()),
+        CheckContext::StatusContext { context, .. } if ctx.has_failed() => Some(context.clone()),
+        _ => None,
     }
 }
 
@@ -436,6 +426,62 @@ mod tests {
                 }),
             }),
         }
+    }
+
+    fn open_pr(number: u32, rollup_state: Option<&str>) -> PullRequest {
+        use crate::model::{Commit, CommitNode, Commits};
+        PullRequest {
+            number,
+            title: format!("PR #{number}"),
+            url: "u".to_string(),
+            created_at: "2026-06-20T10:00:00Z".to_string(),
+            author: None,
+            mergeable: "MERGEABLE".to_string(),
+            is_draft: false,
+            repository: Repository {
+                name_with_owner: "o/r".to_string(),
+            },
+            commits: Commits {
+                nodes: vec![CommitNode {
+                    commit: Commit {
+                        status_check_rollup: rollup_state.map(|st| StatusCheckRollup {
+                            state: st.to_string(),
+                            contexts: Contexts { nodes: vec![] },
+                        }),
+                    },
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn failing_filter_surfaces_every_non_passing_pr() {
+        // --failing is the documented triage flag. A PR that is not known to
+        // be green must not be silently omitted from it: that omission is
+        // exactly how a red PR hides.
+        let out = filter(
+            vec![
+                open_pr(1, None),                   // no verdict at all
+                open_pr(2, Some("SOME_NEW_STATE")), // unrecognized member
+                open_pr(3, Some("FAILURE")),        // outright failure
+                open_pr(4, Some("PENDING")),        // still running
+            ],
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            out.len(),
+            4,
+            "non-passing PRs omitted from --failing: kept {:?}",
+            out.iter().map(|p| p.number).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn failing_filter_still_excludes_passing_prs() {
+        let out = filter(vec![open_pr(1, Some("SUCCESS"))], true, false, false);
+        assert!(out.is_empty(), "a green PR was surfaced by --failing");
     }
 
     #[test]
