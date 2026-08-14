@@ -24,14 +24,20 @@ const REPLACEMENT: char = '·';
 /// Category membership comes from the Unicode tables rather than a local range
 /// list so a codepoint assigned in a later Unicode release cannot silently
 /// reopen this.
+///
+/// Tab becomes a single space rather than the replacement character: it is the
+/// one remaining character whose rendered width is a function of terminal state
+/// (the current column and the tab-stop interval) and therefore cannot be
+/// measured by a column-aligned renderer. A space keeps the separation the tab
+/// implied while making measured width equal rendered width.
 pub fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| {
-            if (c.is_control() && c != '\t') || get_general_category(c) == GeneralCategory::Format {
+        .map(|c| match c {
+            '\t' => ' ',
+            c if c.is_control() || get_general_category(c) == GeneralCategory::Format => {
                 REPLACEMENT
-            } else {
-                c
             }
+            c => c,
         })
         .collect()
 }
@@ -85,6 +91,47 @@ mod tests {
         // honest PR titles.
         let s = "Bump lodash 4.17.21 — Café 日本語 🎉";
         assert_eq!(sanitize(s), s);
+    }
+
+    #[test]
+    fn sanitize_neutralizes_tab() {
+        // comfy-table measures U+0009 as one display column; a terminal expands
+        // it to the next 8-column tab stop. Leaving it intact lets an
+        // attacker-chosen title overrun the rendered table box.
+        let out = sanitize("chore:\tbump\tlodash");
+        assert!(!out.contains('\t'), "tab survived sanitize(): {out:?}");
+    }
+
+    #[test]
+    fn sanitize_maps_tab_to_a_single_space() {
+        // A space keeps the token separation the tab implied while making
+        // measured width and rendered width identical.
+        assert_eq!(sanitize("a\tb"), "a b");
+    }
+
+    #[test]
+    fn sanitized_text_has_no_width_ambiguity() {
+        // Every character the encoder emits must render in exactly the width
+        // the renderer accounts for it. Tab is the only variable-width
+        // character reachable here.
+        let painted = |s: &str| {
+            let mut col = 0usize;
+            for ch in s.chars() {
+                col = if ch == '\t' {
+                    (col / 8 + 1) * 8
+                } else {
+                    col + 1
+                };
+            }
+            col
+        };
+        let hostile = "x\t".repeat(20);
+        let out = sanitize(&hostile);
+        assert_eq!(
+            painted(&out),
+            out.chars().count(),
+            "sanitized output still renders wider than it measures"
+        );
     }
 
     #[test]
