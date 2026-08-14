@@ -35,7 +35,11 @@ Data flow: `main` → `github::current_user` → `github::fetch_prs(owner)` + `g
 
 The post-merge section exists because post-merge workflows (supply-chain scan, docker build+push) are triggered by the push to the default branch, so their check suite attaches to the **merge commit** — not the PR head commit the open-PR rollup reflects. Without this, a PR that merges green but fails its delivery pipeline is silent.
 
-Within the 7-day window, only the **most-recently-merged PR per repo** is reported (and only if its post-merge CI is still failing). Each merge to the default branch re-runs the full pipeline over the rolled-up tree, so a later green merge supersedes earlier red ones — their changes are already in the passing build. `latest_failing_per_repo` runs over the full merged list before filtering by failure, so a later success can override earlier failures; the reduction is per-repo, so one red repo never suppresses another.
+Within the 7-day window, each repo reports its **newest merge that has a settled verdict**, and only when that verdict is a failure. Each merge to the default branch re-runs the full pipeline over the rolled-up tree, so a later **green** merge supersedes earlier red ones — their changes are already in the passing build.
+
+Only a green one. Supersession is justified by a *passing* rebuild, because that is the argument that the earlier changes are now fine; a pending, absent or unrecognized verdict proves nothing and must not consume the evidence. `latest_failing_per_repo` therefore scans newest-first and treats `Verdict::Unknown` as deciding nothing, falling through to the newest merge that does have a verdict. The reduction is per-repo, so one red repo never suppresses another.
+
+(This paragraph previously described the reduction as picking the most-recently-merged PR and *then* filtering by failure. That was the implementation, and it was the bug — VULN-005: a newer merge whose CI had not finished evicted a real failure, which then never printed.)
 
 ## Environment Variables
 

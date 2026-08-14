@@ -1,10 +1,10 @@
-use crate::model::{CheckContext, MergedPullRequest, PullRequest};
+use crate::model::{CheckContext, Mergeability, MergedPullRequest, PullRequest, Verdict};
 use crate::text::sanitize;
 use chrono::{DateTime, Utc};
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, ContentArrangement, Table};
 use owo_colors::OwoColorize;
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 pub fn filter(
     prs: Vec<PullRequest>,
@@ -15,7 +15,11 @@ pub fn filter(
     prs.into_iter()
         .filter(|pr| !(no_drafts && pr.is_draft))
         .filter(|pr| !only_bot || pr.is_bot())
-        .filter(|pr| !only_failing || pr.is_failing())
+        // --failing means "not known to be green", not "known to be red". A PR
+        // whose verdict is unsettled is exactly the case an attacker can
+        // manufacture by pushing a commit, so excluding it would reopen the
+        // hole the Verdict tri-state exists to close.
+        .filter(|pr| !only_failing || pr.verdict() != Verdict::Passing)
         .collect()
 }
 
@@ -115,11 +119,7 @@ pub fn print(prs: &[PullRequest]) {
     println!("{}", build_table(&sorted));
 
     let failing: Vec<&PullRequest> = sorted.iter().copied().filter(|p| p.is_failing()).collect();
-    let conflicts: Vec<&PullRequest> = sorted
-        .iter()
-        .copied()
-        .filter(|p| p.mergeable == "CONFLICTING")
-        .collect();
+    let (conflicts, undetermined) = partition_mergeability(&sorted);
 
     if !failing.is_empty() {
         println!("\n{}", "Failing checks:".bold().underline());
@@ -153,39 +153,129 @@ pub fn print(prs: &[PullRequest]) {
         }
     }
 
+    if !undetermined.is_empty() {
+        println!("\n{}", "Mergeability not determined:".bold().underline());
+        for pr in &undetermined {
+            println!(
+                "  {} {} {}",
+                sanitize(&pr.repository.name_with_owner).cyan(),
+                format!("#{}", pr.number).cyan(),
+                truncate(&pr.title, 80).dimmed()
+            );
+        }
+    }
+
     let total = prs.len();
     let bot_count = prs.iter().filter(|p| p.is_bot()).count();
     println!(
         "\n{}",
         format!(
-            "{total} open PR(s) — {} failing, {} conflicting, {bot_count} from bots",
+            "{total} open PR(s) — {} failing, {} conflicting, {} undetermined, {bot_count} from bots",
             failing.len(),
-            conflicts.len()
+            conflicts.len(),
+            undetermined.len()
         )
         .dimmed()
     );
 }
 
-/// Reduce merged PRs to the single most-recently-merged PR per repository, then
-/// keep only those whose post-merge CI is still failing.
+/// Split PRs into (conflicting, undetermined).
 ///
-/// Each merge to the default branch re-runs the post-merge pipeline (supply-chain
-/// scan, docker build+push) over the full rolled-up tree. If the latest merge in a
-/// repo is green, any earlier failures in the window are already superseded — their
-/// changes were rolled into the latest (passing) build. So only a still-red latest
-/// merge warrants attention; reporting the stale failures is just noise.
-pub fn latest_failing_per_repo(merged: Vec<MergedPullRequest>) -> Vec<MergedPullRequest> {
-    let mut latest: HashMap<String, MergedPullRequest> = HashMap::new();
-    for pr in merged {
-        match latest.get(&pr.repository.name_with_owner) {
-            // `merged_at` is RFC3339 UTC ("…Z"), so lexicographic == chronological order.
-            Some(existing) if existing.merged_at >= pr.merged_at => {}
-            _ => {
-                latest.insert(pr.repository.name_with_owner.clone(), pr);
-            }
+/// UNKNOWN means GitHub has not finished calculating mergeability, not that the
+/// PR merges cleanly. Keeping it as its own bucket is what makes the absence of
+/// a determination visible instead of rendering it as a favourable one — and it
+/// is deliberately NOT folded into the conflict count, since UNKNOWN is not
+/// evidence of a conflict either.
+fn partition_mergeability<'a>(
+    prs: &[&'a PullRequest],
+) -> (Vec<&'a PullRequest>, Vec<&'a PullRequest>) {
+    let mut conflicts = Vec::new();
+    let mut undetermined = Vec::new();
+    for pr in prs {
+        match pr.mergeability() {
+            Mergeability::Conflicting => conflicts.push(*pr),
+            Mergeability::Unknown => undetermined.push(*pr),
+            Mergeability::Clean => {}
         }
     }
-    latest.into_values().filter(|pr| pr.is_failing()).collect()
+    (conflicts, undetermined)
+}
+
+/// Sort key for a merge time.
+///
+/// Parsed rather than compared as a string, so the ordering does not silently
+/// depend on GitHub continuing to serialize fixed-width RFC3339 `…Z` values. An
+/// unparseable timestamp sorts oldest, so a record we cannot place can never
+/// win the newest slot and supersede a real verdict.
+fn merged_at_key(pr: &MergedPullRequest) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&pr.merged_at)
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
+/// Order a failing verdict ahead of any other, for use as a tie-break.
+fn a_fails_first(a: &MergedPullRequest, b: &MergedPullRequest) -> std::cmp::Ordering {
+    let rank = |pr: &MergedPullRequest| u8::from(pr.verdict() != Verdict::Failing);
+    rank(a).cmp(&rank(b))
+}
+
+/// Report, per repository, the newest merge that has a settled verdict — but
+/// only when that verdict is a failure.
+///
+/// Each merge to the default branch re-runs the post-merge pipeline
+/// (supply-chain scan, docker build+push) over the full rolled-up tree. A
+/// *passing* rebuild is therefore a positive argument that every earlier change
+/// in the window is now green, and it supersedes earlier failures.
+///
+/// Only a passing one. The previous implementation picked each repo's winner by
+/// recency and consulted the verdict afterwards, so a newer merge that had not
+/// finished CI — or had no merge commit at all — evicted a real FAILURE that
+/// then never printed. An unsettled verdict is not evidence of anything, so it
+/// no longer supersedes: the scan falls through to the newest merge that does
+/// have a verdict. No attacker is needed to hit that case; an ordinary merge
+/// landing while CI is queued is enough.
+pub fn latest_failing_per_repo(mut merged: Vec<MergedPullRequest>) -> Vec<MergedPullRequest> {
+    // Newest first, so the first settled verdict per repo is the deciding one.
+    //
+    // The order must be *total*: `mergedAt` has one-second granularity, so two
+    // merges sharing a timestamp are ordinary, and comparing on the timestamp
+    // alone left the winner to be whichever node the API happened to return
+    // first. Ties break on the failing verdict, then on PR number, so the
+    // result is reproducible across runs.
+    merged.sort_by(|a, b| {
+        merged_at_key(b)
+            .cmp(&merged_at_key(a))
+            // Within the same second we cannot tell which merge landed last, so
+            // we cannot argue the green build contains the red one's changes.
+            // Look at the failure first and report it, rather than assume it
+            // away. (The scan proposed breaking ties on PR number alone, which
+            // is deterministic but would let a tied pass bury a tied failure —
+            // PR number tracks creation order, not merge order.)
+            .then_with(|| a_fails_first(a, b))
+            .then_with(|| b.number.cmp(&a.number))
+    });
+
+    let mut decided: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for pr in merged {
+        if decided.contains(&pr.repository.name_with_owner) {
+            continue;
+        }
+        match pr.verdict() {
+            // A green rebuild settles this repo and supersedes what came before.
+            Verdict::Passing => {
+                decided.insert(pr.repository.name_with_owner.clone());
+            }
+            // A red rebuild settles this repo and is what we are here to report.
+            Verdict::Failing => {
+                decided.insert(pr.repository.name_with_owner.clone());
+                out.push(pr);
+            }
+            // No verdict yet: decides nothing, so keep looking further back.
+            Verdict::Unknown => {}
+        }
+    }
+    out
 }
 
 /// Render post-merge CI failures: PRs that merged cleanly but whose default-branch
@@ -225,23 +315,9 @@ pub fn print_post_merge(prs: &[MergedPullRequest]) {
 
 fn failed_check_name(ctx: &CheckContext) -> Option<String> {
     match ctx {
-        CheckContext::CheckRun {
-            name, conclusion, ..
-        } => match conclusion.as_deref() {
-            Some("FAILURE")
-            | Some("TIMED_OUT")
-            | Some("CANCELLED")
-            | Some("STARTUP_FAILURE")
-            | Some("ACTION_REQUIRED") => Some(name.clone()),
-            _ => None,
-        },
-        CheckContext::StatusContext { context, state, .. } => {
-            if state == "FAILURE" || state == "ERROR" {
-                Some(context.clone())
-            } else {
-                None
-            }
-        }
+        CheckContext::CheckRun { name, .. } if ctx.has_failed() => Some(name.clone()),
+        CheckContext::StatusContext { context, .. } if ctx.has_failed() => Some(context.clone()),
+        _ => None,
     }
 }
 
@@ -436,6 +512,232 @@ mod tests {
                 }),
             }),
         }
+    }
+
+    fn open_pr_numbered(number: u32, rollup_state: Option<&str>) -> PullRequest {
+        use crate::model::{Commit, CommitNode, Commits};
+        PullRequest {
+            number,
+            title: format!("PR #{number}"),
+            url: "u".to_string(),
+            created_at: "2026-06-20T10:00:00Z".to_string(),
+            author: None,
+            mergeable: "MERGEABLE".to_string(),
+            is_draft: false,
+            repository: Repository {
+                name_with_owner: "o/r".to_string(),
+            },
+            commits: Commits {
+                nodes: vec![CommitNode {
+                    commit: Commit {
+                        status_check_rollup: rollup_state.map(|st| StatusCheckRollup {
+                            state: st.to_string(),
+                            contexts: Contexts { nodes: vec![] },
+                        }),
+                    },
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn failing_filter_surfaces_every_non_passing_pr() {
+        // --failing is the documented triage flag. A PR that is not known to
+        // be green must not be silently omitted from it: that omission is
+        // exactly how a red PR hides.
+        let out = filter(
+            vec![
+                open_pr_numbered(1, None),                   // no verdict at all
+                open_pr_numbered(2, Some("SOME_NEW_STATE")), // unrecognized member
+                open_pr_numbered(3, Some("FAILURE")),        // outright failure
+                open_pr_numbered(4, Some("PENDING")),        // still running
+            ],
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            out.len(),
+            4,
+            "non-passing PRs omitted from --failing: kept {:?}",
+            out.iter().map(|p| p.number).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn failing_filter_still_excludes_passing_prs() {
+        let out = filter(
+            vec![open_pr_numbered(1, Some("SUCCESS"))],
+            true,
+            false,
+            false,
+        );
+        assert!(out.is_empty(), "a green PR was surfaced by --failing");
+    }
+
+    /// A merged PR whose merge commit carries no rollup at all.
+    fn merged_no_rollup(repo: &str, number: u32, merged_at: &str) -> MergedPullRequest {
+        let mut m = merged(repo, number, merged_at, "SUCCESS");
+        m.merge_commit = Some(Commit {
+            status_check_rollup: None,
+        });
+        m
+    }
+
+    /// A merged PR with no merge commit recorded at all.
+    fn merged_no_commit(repo: &str, number: u32, merged_at: &str) -> MergedPullRequest {
+        let mut m = merged(repo, number, merged_at, "SUCCESS");
+        m.merge_commit = None;
+        m
+    }
+
+    #[test]
+    fn a_verdictless_newer_merge_does_not_evict_a_failure() {
+        // Supersession is justified only by a PASSING rebuild — that is the
+        // argument that the earlier changes are now green. A pending or absent
+        // verdict proves nothing and must not consume the evidence.
+        for (label, newer) in [
+            (
+                "null rollup",
+                merged_no_rollup("o/r", 2, "2026-08-12T10:00:00Z"),
+            ),
+            (
+                "no merge commit",
+                merged_no_commit("o/r", 2, "2026-08-12T10:00:00Z"),
+            ),
+            (
+                "pending",
+                merged("o/r", 2, "2026-08-12T10:00:00Z", "PENDING"),
+            ),
+        ] {
+            let out = latest_failing_per_repo(vec![
+                merged("o/r", 1, "2026-08-11T10:00:00Z", "FAILURE"),
+                newer,
+            ]);
+            assert_eq!(
+                out.len(),
+                1,
+                "a newer merge with a {label} verdict evicted a real FAILURE"
+            );
+            assert_eq!(out[0].number, 1);
+        }
+    }
+
+    #[test]
+    fn an_unsettled_merge_falls_through_to_the_newest_settled_one() {
+        // Two unsettled merges on top of a failure must still not hide it.
+        let out = latest_failing_per_repo(vec![
+            merged("o/r", 1, "2026-08-10T10:00:00Z", "FAILURE"),
+            merged("o/r", 2, "2026-08-11T10:00:00Z", "PENDING"),
+            merged_no_rollup("o/r", 3, "2026-08-12T10:00:00Z"),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].number, 1);
+    }
+
+    #[test]
+    fn an_unsettled_merge_does_not_resurrect_a_superseded_failure() {
+        // Ordering matters: FAILURE, then a genuine PASS, then an unsettled
+        // merge. The pass already superseded the failure, so nothing reports.
+        let out = latest_failing_per_repo(vec![
+            merged("o/r", 1, "2026-08-10T10:00:00Z", "FAILURE"),
+            merged("o/r", 2, "2026-08-11T10:00:00Z", "SUCCESS"),
+            merged_no_rollup("o/r", 3, "2026-08-12T10:00:00Z"),
+        ]);
+        assert!(
+            out.is_empty(),
+            "a failure already superseded by a green rebuild was resurrected"
+        );
+    }
+
+    #[test]
+    fn mergeability_partition_buckets_each_pr_exactly_once() {
+        // The section headings and the summary counts are driven from this
+        // split, so a mis-wired bucket would silently under-report again.
+        let mut clean = open_pr_numbered(1, Some("SUCCESS"));
+        clean.mergeable = "MERGEABLE".to_string();
+        let mut conflicting = open_pr_numbered(2, Some("SUCCESS"));
+        conflicting.mergeable = "CONFLICTING".to_string();
+        let mut unknown = open_pr_numbered(3, Some("SUCCESS"));
+        unknown.mergeable = "UNKNOWN".to_string();
+        let mut future = open_pr_numbered(4, Some("SUCCESS"));
+        future.mergeable = "SOME_NEW_STATE".to_string();
+
+        let all = [&clean, &conflicting, &unknown, &future];
+        let (conflicts, undetermined) = partition_mergeability(&all);
+
+        assert_eq!(
+            conflicts.iter().map(|p| p.number).collect::<Vec<_>>(),
+            vec![2],
+            "conflict bucket wrong"
+        );
+        assert_eq!(
+            undetermined.iter().map(|p| p.number).collect::<Vec<_>>(),
+            vec![3, 4],
+            "undetermined bucket must hold UNKNOWN and unrecognized states"
+        );
+        // A clean PR belongs to neither, and nothing may be double-counted.
+        assert_eq!(conflicts.len() + undetermined.len(), 3);
+    }
+
+    #[test]
+    fn an_undetermined_pr_is_never_counted_as_conflicting() {
+        let mut unknown = open_pr_numbered(1, Some("SUCCESS"));
+        unknown.mergeable = "UNKNOWN".to_string();
+        let (conflicts, undetermined) = partition_mergeability(&[&unknown]);
+        assert!(conflicts.is_empty(), "UNKNOWN was counted as a conflict");
+        assert_eq!(undetermined.len(), 1, "UNKNOWN was dropped entirely");
+    }
+
+    #[test]
+    fn a_merged_at_tie_resolves_identically_regardless_of_arrival_order() {
+        // mergedAt has one-second granularity, so ties are ordinary. The answer
+        // must not depend on the order GitHub happened to return the nodes in.
+        let red = || merged("o/r", 1, "2026-08-12T10:00:00Z", "FAILURE");
+        let green = || merged("o/r", 2, "2026-08-12T10:00:00Z", "SUCCESS");
+
+        let red_first = latest_failing_per_repo(vec![red(), green()]);
+        let green_first = latest_failing_per_repo(vec![green(), red()]);
+
+        assert_eq!(
+            red_first.len(),
+            green_first.len(),
+            "the same two records produced different answers depending on order"
+        );
+    }
+
+    #[test]
+    fn a_merged_at_tie_does_not_let_a_pass_bury_a_failure() {
+        // When two merges share a timestamp we genuinely cannot tell which
+        // landed second, so we cannot claim the green build contains the red
+        // one's changes. Report the failure rather than assume it away.
+        for input in [
+            vec![
+                merged("o/r", 1, "2026-08-12T10:00:00Z", "FAILURE"),
+                merged("o/r", 2, "2026-08-12T10:00:00Z", "SUCCESS"),
+            ],
+            vec![
+                merged("o/r", 2, "2026-08-12T10:00:00Z", "SUCCESS"),
+                merged("o/r", 1, "2026-08-12T10:00:00Z", "FAILURE"),
+            ],
+        ] {
+            let out = latest_failing_per_repo(input);
+            assert_eq!(out.len(), 1, "tied failure was buried by a tied pass");
+            assert_eq!(out[0].number, 1);
+        }
+    }
+
+    #[test]
+    fn a_later_pass_still_supersedes_an_earlier_failure() {
+        // The tie rule must not weaken genuine supersession at distinct times.
+        let out = latest_failing_per_repo(vec![
+            merged("o/r", 1, "2026-08-12T10:00:00Z", "FAILURE"),
+            merged("o/r", 2, "2026-08-12T10:00:01Z", "SUCCESS"),
+        ]);
+        assert!(
+            out.is_empty(),
+            "a genuinely later green merge stopped superseding"
+        );
     }
 
     #[test]
