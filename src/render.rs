@@ -119,19 +119,7 @@ pub fn print(prs: &[PullRequest]) {
     println!("{}", build_table(&sorted));
 
     let failing: Vec<&PullRequest> = sorted.iter().copied().filter(|p| p.is_failing()).collect();
-    let conflicts: Vec<&PullRequest> = sorted
-        .iter()
-        .copied()
-        .filter(|p| p.mergeability() == Mergeability::Conflicting)
-        .collect();
-    // UNKNOWN means GitHub has not finished calculating, not that the PR merges
-    // cleanly. Surfacing it as its own state keeps the absence of a
-    // determination visible instead of rendering it as a favourable one.
-    let undetermined: Vec<&PullRequest> = sorted
-        .iter()
-        .copied()
-        .filter(|p| p.mergeability() == Mergeability::Unknown)
-        .collect();
+    let (conflicts, undetermined) = partition_mergeability(&sorted);
 
     if !failing.is_empty() {
         println!("\n{}", "Failing checks:".bold().underline());
@@ -189,6 +177,28 @@ pub fn print(prs: &[PullRequest]) {
         )
         .dimmed()
     );
+}
+
+/// Split PRs into (conflicting, undetermined).
+///
+/// UNKNOWN means GitHub has not finished calculating mergeability, not that the
+/// PR merges cleanly. Keeping it as its own bucket is what makes the absence of
+/// a determination visible instead of rendering it as a favourable one — and it
+/// is deliberately NOT folded into the conflict count, since UNKNOWN is not
+/// evidence of a conflict either.
+fn partition_mergeability<'a>(
+    prs: &[&'a PullRequest],
+) -> (Vec<&'a PullRequest>, Vec<&'a PullRequest>) {
+    let mut conflicts = Vec::new();
+    let mut undetermined = Vec::new();
+    for pr in prs {
+        match pr.mergeability() {
+            Mergeability::Conflicting => conflicts.push(*pr),
+            Mergeability::Unknown => undetermined.push(*pr),
+            Mergeability::Clean => {}
+        }
+    }
+    (conflicts, undetermined)
 }
 
 /// Sort key for a merge time.
@@ -556,7 +566,12 @@ mod tests {
 
     #[test]
     fn failing_filter_still_excludes_passing_prs() {
-        let out = filter(vec![open_pr_numbered(1, Some("SUCCESS"))], true, false, false);
+        let out = filter(
+            vec![open_pr_numbered(1, Some("SUCCESS"))],
+            true,
+            false,
+            false,
+        );
         assert!(out.is_empty(), "a green PR was surfaced by --failing");
     }
 
@@ -633,6 +648,45 @@ mod tests {
             out.is_empty(),
             "a failure already superseded by a green rebuild was resurrected"
         );
+    }
+
+    #[test]
+    fn mergeability_partition_buckets_each_pr_exactly_once() {
+        // The section headings and the summary counts are driven from this
+        // split, so a mis-wired bucket would silently under-report again.
+        let mut clean = open_pr_numbered(1, Some("SUCCESS"));
+        clean.mergeable = "MERGEABLE".to_string();
+        let mut conflicting = open_pr_numbered(2, Some("SUCCESS"));
+        conflicting.mergeable = "CONFLICTING".to_string();
+        let mut unknown = open_pr_numbered(3, Some("SUCCESS"));
+        unknown.mergeable = "UNKNOWN".to_string();
+        let mut future = open_pr_numbered(4, Some("SUCCESS"));
+        future.mergeable = "SOME_NEW_STATE".to_string();
+
+        let all = [&clean, &conflicting, &unknown, &future];
+        let (conflicts, undetermined) = partition_mergeability(&all);
+
+        assert_eq!(
+            conflicts.iter().map(|p| p.number).collect::<Vec<_>>(),
+            vec![2],
+            "conflict bucket wrong"
+        );
+        assert_eq!(
+            undetermined.iter().map(|p| p.number).collect::<Vec<_>>(),
+            vec![3, 4],
+            "undetermined bucket must hold UNKNOWN and unrecognized states"
+        );
+        // A clean PR belongs to neither, and nothing may be double-counted.
+        assert_eq!(conflicts.len() + undetermined.len(), 3);
+    }
+
+    #[test]
+    fn an_undetermined_pr_is_never_counted_as_conflicting() {
+        let mut unknown = open_pr_numbered(1, Some("SUCCESS"));
+        unknown.mergeable = "UNKNOWN".to_string();
+        let (conflicts, undetermined) = partition_mergeability(&[&unknown]);
+        assert!(conflicts.is_empty(), "UNKNOWN was counted as a conflict");
+        assert_eq!(undetermined.len(), 1, "UNKNOWN was dropped entirely");
     }
 
     #[test]
