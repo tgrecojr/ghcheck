@@ -13,6 +13,21 @@ pub struct Data<T> {
 #[derive(Debug, Deserialize)]
 pub struct Search<T> {
     pub nodes: Vec<T>,
+    /// Total matches GitHub reports for the query, independent of page size.
+    #[serde(rename = "issueCount", default)]
+    pub issue_count: Option<u32>,
+    /// Absent when the caller did not request it, so an unpaginated response
+    /// still deserializes. Absent is treated as "no further pages".
+    #[serde(rename = "pageInfo", default)]
+    pub page_info: Option<PageInfo>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct PageInfo {
+    #[serde(rename = "hasNextPage", default)]
+    pub has_next_page: bool,
+    #[serde(rename = "endCursor", default)]
+    pub end_cursor: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

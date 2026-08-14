@@ -504,7 +504,7 @@ mod tests {
         }
     }
 
-    fn open_pr(number: u32, rollup_state: Option<&str>) -> PullRequest {
+    fn open_pr_numbered(number: u32, rollup_state: Option<&str>) -> PullRequest {
         use crate::model::{Commit, CommitNode, Commits};
         PullRequest {
             number,
@@ -537,10 +537,10 @@ mod tests {
         // exactly how a red PR hides.
         let out = filter(
             vec![
-                open_pr(1, None),                   // no verdict at all
-                open_pr(2, Some("SOME_NEW_STATE")), // unrecognized member
-                open_pr(3, Some("FAILURE")),        // outright failure
-                open_pr(4, Some("PENDING")),        // still running
+                open_pr_numbered(1, None),                   // no verdict at all
+                open_pr_numbered(2, Some("SOME_NEW_STATE")), // unrecognized member
+                open_pr_numbered(3, Some("FAILURE")),        // outright failure
+                open_pr_numbered(4, Some("PENDING")),        // still running
             ],
             true,
             false,
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn failing_filter_still_excludes_passing_prs() {
-        let out = filter(vec![open_pr(1, Some("SUCCESS"))], true, false, false);
+        let out = filter(vec![open_pr_numbered(1, Some("SUCCESS"))], true, false, false);
         assert!(out.is_empty(), "a green PR was surfaced by --failing");
     }
 
