@@ -1,4 +1,4 @@
-use crate::model::{CheckContext, MergedPullRequest, PullRequest, Verdict};
+use crate::model::{CheckContext, Mergeability, MergedPullRequest, PullRequest, Verdict};
 use crate::text::sanitize;
 use chrono::{DateTime, Utc};
 use comfy_table::presets::UTF8_FULL;
@@ -122,7 +122,15 @@ pub fn print(prs: &[PullRequest]) {
     let conflicts: Vec<&PullRequest> = sorted
         .iter()
         .copied()
-        .filter(|p| p.mergeable == "CONFLICTING")
+        .filter(|p| p.mergeability() == Mergeability::Conflicting)
+        .collect();
+    // UNKNOWN means GitHub has not finished calculating, not that the PR merges
+    // cleanly. Surfacing it as its own state keeps the absence of a
+    // determination visible instead of rendering it as a favourable one.
+    let undetermined: Vec<&PullRequest> = sorted
+        .iter()
+        .copied()
+        .filter(|p| p.mergeability() == Mergeability::Unknown)
         .collect();
 
     if !failing.is_empty() {
@@ -157,14 +165,27 @@ pub fn print(prs: &[PullRequest]) {
         }
     }
 
+    if !undetermined.is_empty() {
+        println!("\n{}", "Mergeability not determined:".bold().underline());
+        for pr in &undetermined {
+            println!(
+                "  {} {} {}",
+                sanitize(&pr.repository.name_with_owner).cyan(),
+                format!("#{}", pr.number).cyan(),
+                truncate(&pr.title, 80).dimmed()
+            );
+        }
+    }
+
     let total = prs.len();
     let bot_count = prs.iter().filter(|p| p.is_bot()).count();
     println!(
         "\n{}",
         format!(
-            "{total} open PR(s) — {} failing, {} conflicting, {bot_count} from bots",
+            "{total} open PR(s) — {} failing, {} conflicting, {} undetermined, {bot_count} from bots",
             failing.len(),
-            conflicts.len()
+            conflicts.len(),
+            undetermined.len()
         )
         .dimmed()
     );

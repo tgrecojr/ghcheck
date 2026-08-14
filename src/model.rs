@@ -130,6 +130,18 @@ impl Verdict {
     }
 }
 
+/// Whether a pull request can be merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mergeability {
+    /// GitHub has determined the PR merges cleanly.
+    Clean,
+    /// GitHub has determined the PR conflicts.
+    Conflicting,
+    /// Mergeability has not been determined — still being calculated, or a
+    /// state this build does not recognize. Deliberately distinct from `Clean`.
+    Unknown,
+}
+
 impl CheckContext {
     /// Whether this individual check has already concluded in failure.
     ///
@@ -219,6 +231,20 @@ impl PullRequest {
         matches!(self.verdict(), Verdict::Failing)
     }
 
+    /// Mergeability as a tri-state.
+    ///
+    /// `UNKNOWN` means GitHub is still calculating, not that the PR merges
+    /// cleanly, and nothing here re-queries — so folding it into "clean" made
+    /// an undetermined PR read as fine indefinitely. Unrecognized future
+    /// members resolve the same way rather than defaulting to clean.
+    pub fn mergeability(&self) -> Mergeability {
+        match self.mergeable.as_str() {
+            "MERGEABLE" => Mergeability::Clean,
+            "CONFLICTING" => Mergeability::Conflicting,
+            _ => Mergeability::Unknown,
+        }
+    }
+
     pub fn is_bot(&self) -> bool {
         let login = self.author_login();
         login.ends_with("[bot]")
@@ -301,6 +327,43 @@ mod tests {
         assert!(
             !pr.is_failing(),
             "PENDING must not be reported as a failure"
+        );
+    }
+
+    fn pr_mergeable(state: &str) -> PullRequest {
+        let mut pr = pr_with_commits(vec![rollup("SUCCESS")]);
+        pr.mergeable = state.to_string();
+        pr
+    }
+
+    #[test]
+    fn unknown_mergeability_is_not_treated_as_clean() {
+        // MergeableState::UNKNOWN means "still being calculated", not "merges
+        // cleanly", and this codebase never re-queries — so an UNKNOWN observed
+        // once would otherwise read as clean forever.
+        assert_eq!(
+            pr_mergeable("UNKNOWN").mergeability(),
+            Mergeability::Unknown
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_mergeable_state_is_not_treated_as_clean() {
+        assert_eq!(
+            pr_mergeable("SOME_NEW_STATE").mergeability(),
+            Mergeability::Unknown
+        );
+    }
+
+    #[test]
+    fn known_mergeable_states_map_directly() {
+        assert_eq!(
+            pr_mergeable("MERGEABLE").mergeability(),
+            Mergeability::Clean
+        );
+        assert_eq!(
+            pr_mergeable("CONFLICTING").mergeability(),
+            Mergeability::Conflicting
         );
     }
 
