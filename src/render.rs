@@ -47,6 +47,45 @@ fn merge_cell(pr: &PullRequest) -> String {
     }
 }
 
+/// Build a table cell from untrusted remote data.
+///
+/// Every column carrying a remote string goes through here, so adding a column
+/// without an encoder is not something you can do by forgetting — it is
+/// something you would have to do deliberately by calling `Cell::new` instead.
+/// Cells holding already-styled local content (`status_cell`, `merge_cell`) are
+/// the deliberate exception: they encode their remote input themselves, before
+/// applying the tool's own colours.
+fn cell(s: impl AsRef<str>) -> Cell {
+    Cell::new(sanitize(s.as_ref()))
+}
+
+/// Build the open-PR table. Split out from `print` so the rendered output can
+/// be asserted on in tests without capturing stdout.
+fn build_table(sorted: &[&PullRequest]) -> Table {
+    let mut table = Table::new();
+    table
+        .load_style(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "REPO", "PR", "TITLE", "AUTHOR", "STATUS", "MERGE", "AGE",
+        ]);
+
+    for pr in sorted {
+        table.add_row(vec![
+            cell(&pr.repository.name_with_owner),
+            cell(format!("#{}", pr.number)),
+            cell(format!("{}{}", truncate(&pr.title, 60), draft_marker(pr))),
+            cell(pr.author_login()),
+            // Pre-styled: these encode their remote input internally so the
+            // tool's own colour codes survive. See status_cell / merge_cell.
+            Cell::new(status_cell(pr)),
+            Cell::new(merge_cell(pr)),
+            cell(humanize_age(&pr.created_at)),
+        ]);
+    }
+    table
+}
+
 fn draft_marker(pr: &PullRequest) -> &'static str {
     if pr.is_draft {
         " (draft)"
@@ -73,27 +112,7 @@ pub fn print(prs: &[PullRequest]) {
             .then_with(|| a.number.cmp(&b.number))
     });
 
-    let mut table = Table::new();
-    table
-        .load_style(UTF8_FULL)
-        .set_content_arrangement(ContentArrangement::Dynamic)
-        .set_header(vec![
-            "REPO", "PR", "TITLE", "AUTHOR", "STATUS", "MERGE", "AGE",
-        ]);
-
-    for pr in &sorted {
-        table.add_row(vec![
-            Cell::new(sanitize(&pr.repository.name_with_owner)),
-            Cell::new(format!("#{}", pr.number)),
-            Cell::new(format!("{}{}", truncate(&pr.title, 60), draft_marker(pr))),
-            Cell::new(pr.author_login()),
-            Cell::new(status_cell(pr)),
-            Cell::new(merge_cell(pr)),
-            Cell::new(humanize_age(&pr.created_at)),
-        ]);
-    }
-
-    println!("{table}");
+    println!("{}", build_table(&sorted));
 
     let failing: Vec<&PullRequest> = sorted.iter().copied().filter(|p| p.is_failing()).collect();
     let conflicts: Vec<&PullRequest> = sorted
@@ -258,7 +277,8 @@ fn humanize_age(created_at: &str) -> String {
 mod tests {
     use super::*;
     use crate::model::{
-        Commit, CommitNode, Commits, Contexts, MergedPullRequest, Repository, StatusCheckRollup,
+        Author, Commit, CommitNode, Commits, Contexts, MergedPullRequest, Repository,
+        StatusCheckRollup,
     };
 
     /// An open PR whose rollup state and mergeable state are attacker-chosen.
@@ -290,6 +310,50 @@ mod tests {
 
     /// A payload the terminal would act on: colour escape, then BEL.
     const HOSTILE: &str = "\u{1b}[31mFORGED-PASS\u{1b}[0m\u{7}";
+
+    /// An open PR with an attacker-chosen author login.
+    fn open_pr_authored_by(login: &str) -> PullRequest {
+        let mut pr = open_pr("MERGEABLE", "SUCCESS");
+        pr.author = Some(Author {
+            login: login.to_string(),
+        });
+        pr
+    }
+
+    #[test]
+    fn author_column_is_encoded() {
+        // GitHub constrains logins to [A-Za-z0-9-], but that is an external
+        // guarantee this codebase asserts nowhere. The renderer must not depend
+        // on it.
+        let pr = open_pr_authored_by(HOSTILE);
+        let rendered = build_table(&[&pr]).to_string();
+        assert!(
+            !rendered.contains("\u{1b}[31mFORGED-PASS"),
+            "attacker colour sequence reached the table: {rendered:?}"
+        );
+        assert!(!rendered.contains('\u{7}'), "BEL reached the table");
+    }
+
+    #[test]
+    fn every_remote_string_column_is_encoded() {
+        // Closes the class rather than the one column that was found: repo
+        // name, title and author all carry remote data into the table.
+        let mut pr = open_pr_authored_by(HOSTILE);
+        pr.title = HOSTILE.to_string();
+        pr.repository.name_with_owner = HOSTILE.to_string();
+        let rendered = build_table(&[&pr]).to_string();
+        assert!(!rendered.contains('\u{7}'), "BEL reached the table");
+        assert!(
+            !rendered.contains("\u{1b}[31mFORGED-PASS"),
+            "attacker colour sequence reached the table: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn ordinary_author_is_left_intact() {
+        let pr = open_pr_authored_by("renovate[bot]");
+        assert!(build_table(&[&pr]).to_string().contains("renovate[bot]"));
+    }
 
     /// A benign but unrecognized member — reaches the same fallback arm without
     /// carrying any escape sequence of its own. Any control character the
