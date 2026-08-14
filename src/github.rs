@@ -147,12 +147,12 @@ pub fn fetch_prs(owner: &str) -> Result<Vec<PullRequest>> {
     paginate(|cursor| search_page::<PullRequest>(QUERY_TEMPLATE, &search, cursor))
 }
 
-/// Run one page of a search query through `gh api graphql`.
-fn search_page<T: serde::de::DeserializeOwned>(
-    query: &str,
-    search: &str,
-    cursor: Option<&str>,
-) -> Result<Search<T>> {
+/// Build the argv for one `gh api graphql` page request.
+///
+/// Split out from `search_page` so the cursor wiring is testable without
+/// spawning a subprocess: dropping the `cursor=` variable would silently
+/// re-fetch page one forever, which looks identical to "no more pages".
+fn graphql_args(query: &str, search: &str, cursor: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "api".to_string(),
         "graphql".to_string(),
@@ -165,9 +165,17 @@ fn search_page<T: serde::de::DeserializeOwned>(
         args.push("-f".to_string());
         args.push(format!("cursor={cursor}"));
     }
+    args
+}
 
+/// Run one page of a search query through `gh api graphql`.
+fn search_page<T: serde::de::DeserializeOwned>(
+    query: &str,
+    search: &str,
+    cursor: Option<&str>,
+) -> Result<Search<T>> {
     let output = Command::new("gh")
-        .args(&args)
+        .args(graphql_args(query, search, cursor))
         .output()
         .context("failed to invoke gh api graphql")?;
 
@@ -246,6 +254,53 @@ mod tests {
                 end_cursor: next.map(|c| c.to_string()),
             }),
         }
+    }
+
+    /// The truncation signals must be present in the documents actually sent
+    /// to GitHub. The paginate() tests below drive a synthetic closure, so
+    /// without this a revert of the query strings — the original defect —
+    /// would leave every other test green.
+    #[test]
+    fn both_query_documents_request_the_truncation_signals() {
+        for (name, doc) in [
+            ("QUERY_TEMPLATE", QUERY_TEMPLATE),
+            ("MERGED_QUERY_TEMPLATE", MERGED_QUERY_TEMPLATE),
+        ] {
+            assert!(
+                doc.contains("issueCount"),
+                "{name} does not request issueCount"
+            );
+            assert!(
+                doc.contains("hasNextPage") && doc.contains("endCursor"),
+                "{name} does not request pageInfo {{ hasNextPage endCursor }}"
+            );
+            assert!(
+                doc.contains("$cursor: String") && doc.contains("after: $cursor"),
+                "{name} does not accept or apply a cursor"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_is_passed_through_to_gh() {
+        // Dropping the cursor variable would silently re-request page one
+        // forever, which is indistinguishable from "no further pages".
+        let first = graphql_args("Q", "is:pr", None);
+        assert!(
+            !first.iter().any(|a| a.starts_with("cursor=")),
+            "first page should not send a cursor: {first:?}"
+        );
+
+        let next = graphql_args("Q", "is:pr", Some("CURSOR1"));
+        assert!(
+            next.iter().any(|a| a == "cursor=CURSOR1"),
+            "cursor was not forwarded to gh: {next:?}"
+        );
+        assert_eq!(
+            next.iter().filter(|a| *a == "-f").count(),
+            3,
+            "cursor was not passed as its own -f variable: {next:?}"
+        );
     }
 
     #[test]
