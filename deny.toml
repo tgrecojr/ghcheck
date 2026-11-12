@@ -27,7 +27,7 @@ allow = [
 confidence-threshold = 0.9
 
 [licenses.private]
-# This crate is not published and declares no license of its own.
+# This crate is not published to a registry.
 ignore = true
 
 [sources]
