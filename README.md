@@ -53,3 +53,11 @@ ghcheck --json               # machine-readable output
 - Colors: `owo-colors`
 - JSON: `serde` / `serde_json`
 - Time: `chrono`
+
+## Contributing
+
+Issues and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first.
+
+## License
+
+Released under the [MIT License](LICENSE).
